@@ -1,0 +1,298 @@
+import json
+import os
+import urllib.request
+import requests
+import boto3
+import time
+
+# Environment Variables
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+HF_API_TOKEN = os.environ["HF_API_TOKEN"]
+S3_BUCKET = os.environ["S3_BUCKET"]
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+HF_MODEL = "HuggingFaceH4/zephyr-7b-alpha"
+HF_IMAGE_MODEL = "prompthero/openjourney"  # ✅ Open access model
+
+# AWS Clients
+s3 = boto3.client("s3")
+transcribe = boto3.client("transcribe")
+textract = boto3.client("textract")
+dynamodb = boto3.resource("dynamodb", region_name=REGION)
+dynamo_table = dynamodb.Table("TelegramBotHistory")
+
+# Track user modes and document texts
+user_modes = {}
+document_texts = {}  # chat_id : extracted_text
+
+# Utility functions
+def send_message(chat_id, text):
+    url = f"{TELEGRAM_API_URL}/sendMessage"
+    data = json.dumps({"chat_id": chat_id, "text": text}).encode()
+    req = urllib.request.Request(url, data, headers={"Content-Type": "application/json"})
+    urllib.request.urlopen(req)
+
+def send_photo(chat_id, image_path):
+    url = f"{TELEGRAM_API_URL}/sendPhoto"
+    with open(image_path, "rb") as photo:
+        files = {'photo': photo}
+        data = {'chat_id': chat_id}
+        requests.post(url, data=data, files=files)
+
+def send_menu(chat_id):
+    menu = {
+        "chat_id": chat_id,
+        "text": "Please select an option:",
+        "reply_markup": {
+            "inline_keyboard": [
+                [
+                    {"text": "🖼 Generate Image", "callback_data": "generate_image"},
+                    {"text": "🧠 Ask a Question", "callback_data": "ask_question"}
+                ],
+                [
+                    {"text": "🎷 Voice Message", "callback_data": "voice_message"},
+                    {"text": "❤️ Sentiment Analysis", "callback_data": "sentiment"}
+                ],
+                [
+                    {"text": "📄 Image Q&A", "callback_data": "document_qa"}
+                ]
+            ]
+        }
+    }
+    url = f"{TELEGRAM_API_URL}/sendMessage"
+    req = urllib.request.Request(url, json.dumps(menu).encode(), headers={"Content-Type": "application/json"})
+    urllib.request.urlopen(req)
+
+def log_conversation(chat_id, mode, user_input, bot_response):
+    try:
+        dynamo_table.put_item(
+            Item={
+                "chat_id": str(chat_id),
+                "timestamp": int(time.time()),
+                "mode": mode,
+                "user_input": user_input,
+                "bot_response": bot_response
+            }
+        )
+    except Exception as e:
+        print("DynamoDB log error:", str(e))
+
+# Features
+def query_huggingface(prompt):
+    headers = {
+        "Authorization": f"Bearer {HF_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "inputs": f"Answer the question in one sentence with a short explanation.\nQuestion: {prompt}",
+        "parameters": {
+            "max_new_tokens": 150,
+            "do_sample": True,
+            "temperature": 0.7
+        }
+    }
+    response = requests.post(f"https://api-inference.huggingface.co/models/{HF_MODEL}", headers=headers, json=payload)
+    if response.status_code == 200:
+        result = response.json()
+        return result[0]['generated_text'][len(prompt):].strip()
+    else:
+        print("HF error:", response.text)
+        return "Sorry, I couldn't think of a reply!"
+
+def analyze_sentiment(text):
+    headers = {
+        "Authorization": f"Bearer {HF_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {"inputs": text}
+    try:
+        response = requests.post(
+            "https://api-inference.huggingface.co/models/cardiffnlp/twitter-roberta-base-sentiment",
+            headers=headers,
+            json=payload
+        )
+        result = response.json()
+        label = result[0][0]['label']
+        mapping = {"LABEL_0": "Negative 😞", "LABEL_1": "Neutral 😐", "LABEL_2": "Positive 😊"}
+        return f"Sentiment: {mapping.get(label, label)}"
+    except Exception as e:
+        print("Sentiment exception:", str(e))
+        return "Could not analyze sentiment."
+
+def generate_image(prompt, chat_id):
+    try:
+        send_message(chat_id, "🎨 Generating your image, please wait...")
+
+        headers = {
+            "Authorization": f"Bearer {HF_API_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        payload = {"inputs": prompt}
+
+        response = requests.post(
+            f"https://api-inference.huggingface.co/models/{HF_IMAGE_MODEL}",
+            headers=headers,
+            json=payload
+        )
+
+        print(f"HuggingFace response status: {response.status_code}")
+        print(f"HuggingFace response text: {response.text}")
+
+        if response.status_code == 200:
+            image_path = "/tmp/generated_image.png"
+            with open(image_path, "wb") as f:
+                f.write(response.content)
+
+            send_photo(chat_id, image_path)
+            return True
+        else:
+            return False
+    except Exception as e:
+        print("Image generation exception:", str(e))
+        return False
+
+def handle_voice_message(chat_id, file_id):
+    try:
+        file_info = requests.get(f"{TELEGRAM_API_URL}/getFile?file_id={file_id}").json()
+        file_path = file_info["result"]["file_path"]
+        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        response = requests.get(file_url)
+        local_file = "/tmp/audio.ogg"
+        with open(local_file, "wb") as f:
+            f.write(response.content)
+
+        key = f"voice-{int(time.time())}.ogg"
+        s3.upload_file(local_file, S3_BUCKET, key)
+        job_name = f"transcribe-{int(time.time())}"
+        s3_uri = f"s3://{S3_BUCKET}/{key}"
+
+        transcribe.start_transcription_job(
+            TranscriptionJobName=job_name,
+            Media={"MediaFileUri": s3_uri},
+            MediaFormat="ogg",
+            LanguageCode="en-US"
+        )
+
+        while True:
+            status = transcribe.get_transcription_job(TranscriptionJobName=job_name)
+            if status["TranscriptionJob"]["TranscriptionJobStatus"] in ["COMPLETED", "FAILED"]:
+                break
+            time.sleep(5)
+
+        if status["TranscriptionJob"]["TranscriptionJobStatus"] == "FAILED":
+            send_message(chat_id, "❌ Transcription failed.")
+            return {"statusCode": 200}
+
+        transcript_url = status["TranscriptionJob"]["Transcript"]["TranscriptFileUri"]
+        transcript_text = requests.get(transcript_url).json()['results']['transcripts'][0]['transcript']
+
+        send_message(chat_id, f"🖙️ You said: {transcript_text}")
+        log_conversation(chat_id, "voice_message", "(voice)", transcript_text)
+        return {"statusCode": 200}
+    except Exception as e:
+        print("Voice error:", str(e))
+        send_message(chat_id, "⚠️ Couldn't process voice message.")
+        return {"statusCode": 500}
+
+def process_pdf(chat_id, file_id):
+    try:
+        file_info = requests.get(f"{TELEGRAM_API_URL}/getFile?file_id={file_id}").json()
+        file_path = file_info["result"]["file_path"]
+        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+        response = requests.get(file_url)
+
+        local_file = "/tmp/document.pdf"
+        with open(local_file, "wb") as f:
+            f.write(response.content)
+
+        key = f"document-{int(time.time())}.pdf"
+        s3.upload_file(local_file, S3_BUCKET, key)
+
+        response = textract.detect_document_text(
+            Document={'S3Object': {'Bucket': S3_BUCKET, 'Name': key}}
+        )
+
+        text = ' '.join([item["Text"] for item in response["Blocks"] if item["BlockType"] == "LINE"])
+        document_texts[chat_id] = text
+
+        send_message(chat_id, "✅ Image is processed! Now ask a question about the Image.")
+    except Exception as e:
+        print("Textract error:", str(e))
+        send_message(chat_id, "⚠️ Could not process the Image.")
+
+# Lambda Handler
+def lambda_handler(event, context):
+    try:
+        print("✅ Loaded HuggingFace + OpenJourney version of the bot")
+        body = json.loads(event["body"])
+
+        if "callback_query" in body:
+            callback = body["callback_query"]
+            chat_id = callback["message"]["chat"]["id"]
+            data = callback["data"]
+            user_modes[chat_id] = data
+
+            if data == "generate_image":
+                send_message(chat_id, "Send a prompt to generate an image.")
+            elif data == "ask_question":
+                send_message(chat_id, "Ask your question.")
+            elif data == "voice_message":
+                send_message(chat_id, "Send your voice message now.")
+            elif data == "sentiment":
+                send_message(chat_id, "Send a message to analyze sentiment.")
+            elif data == "document_qa":
+                send_message(chat_id, "Please upload a PDF to extract and ask questions.")
+            return {"statusCode": 200}
+
+        message = body.get("message", {})
+        chat_id = message.get("chat", {}).get("id")
+        user_input = message.get("text")
+        voice = message.get("voice")
+        document = message.get("document")
+
+        if user_input == "/start":
+            send_menu(chat_id)
+            return {"statusCode": 200}
+
+        mode = user_modes.get(chat_id)
+
+        if document and mode == "document_qa":
+            file_id = document.get("file_id")
+            send_message(chat_id, "🧩 Processing your Image. Please wait...")
+            process_pdf(chat_id, file_id)
+            return {"statusCode": 200}
+
+        if voice:
+            file_id = voice.get("file_id")
+            return handle_voice_message(chat_id, file_id)
+
+        if not chat_id or not user_input:
+            return {"statusCode": 200, "body": "No valid prompt or chat ID"}
+
+        if mode == "document_qa" and chat_id in document_texts:
+            combined_input = f"Document: {document_texts[chat_id]}\n\nQuestion: {user_input}"
+            answer = query_huggingface(combined_input)
+            send_message(chat_id, answer)
+            log_conversation(chat_id, mode, user_input, answer)
+        elif mode == "generate_image":
+            success = generate_image(user_input, chat_id)
+            if success:
+                log_conversation(chat_id, mode, user_input, "Image generated")
+            else:
+                send_message(chat_id, "⚠️ Failed to generate image. Please try again later.")
+        elif mode == "sentiment":
+            sentiment = analyze_sentiment(user_input)
+            send_message(chat_id, sentiment)
+            log_conversation(chat_id, mode, user_input, sentiment)
+        elif mode == "ask_question":
+            bot_reply = query_huggingface(user_input)
+            send_message(chat_id, bot_reply)
+            log_conversation(chat_id, mode, user_input, bot_reply)
+        else:
+            send_message(chat_id, "Please select an option from the menu with /start.")
+
+        return {"statusCode": 200}
+    except Exception as e:
+        print("Error:", str(e))
+        return {"statusCode": 500, "body": str(e)}
