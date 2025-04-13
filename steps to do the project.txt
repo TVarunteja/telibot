@@ -1,0 +1,153 @@
+🧩 Step 1: Setup AWS Account & Services
+Create AWS Account (if you don’t have one)
+
+Go to IAM → Create a role for Lambda execution:
+
+✅ Allow permissions:
+
+AmazonS3FullAccess
+
+AmazonTextractFullAccess
+
+AmazonTranscribeFullAccess
+
+DynamoDBFullAccess
+
+CloudWatchFullAccess
+
+Textract
+
+✅ Create an S3 bucket
+
+For storing uploaded voice files and PDFs
+
+✅ Create DynamoDB table
+
+Table name: TelegramBotHistory
+
+Partition key: chat_id (String)
+
+Sort key: timestamp (Number)
+
+🧩 Step 2: Setup the Telegram Bot
+Go to BotFather on Telegram
+
+Create a new bot, get your Telegram Token
+
+Set the webhook:
+
+Using AWS API Gateway → Lambda integration
+
+🧩 Step 3: Write Lambda Function
+✅ Write your Python code:
+
+Handle incoming Telegram messages
+
+Menu with options:
+
+Generate Image (OpenAI API)
+
+Q&A (HuggingFace API)
+
+Voice Transcription (AWS Transcribe)
+
+Sentiment Analysis (HuggingFace)
+
+PDF Q&A (AWS Textract)
+
+✅ Store chat history:
+
+Log user message + bot response in DynamoDB
+
+✅ Use environment variables:
+
+TELEGRAM_TOKEN
+
+HF_API_TOKEN
+
+OPENAI_API_KEY
+
+S3_BUCKET
+
+AWS_REGION
+
+✅ Return responses to the user directly in Telegram chat.
+
+🧩 Step 4: Connect Lambda to Telegram
+✅ Deploy Lambda function
+
+✅ Setup API Gateway
+
+Create REST API → Lambda integration
+
+Deploy the API and get the invoke URL
+
+✅ Set Webhook in Telegram:
+
+bash
+Copy
+Edit
+https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook?url=<YOUR_API_GATEWAY_URL>
+🧩 Step 5: Enable PDF Support (AWS Textract)
+✅ When user uploads a PDF, store it in S3
+
+✅ Trigger Textract to extract the text
+
+✅ Use extracted text as context for answering user questions
+
+🧩 Step 6: Test All Features
+✅ Test image generation by typing prompts
+
+✅ Upload voice message and verify transcription
+
+✅ Upload PDF and ask questions
+
+✅ Test sentiment analysis on text inputs
+
+✅ Verify DynamoDB is storing conversation history
+
+🧩 Step 7: Polish & Optimize
+✅ Clean up Lambda logs with CloudWatch
+
+✅ Add error handling for empty inputs, API errors
+
+✅ Test load (Lambda is scalable!)
+
+✅ Add professional menu in Telegram bot
+
+🧩 Step 8: Optional Enhancements
+✅ Add CloudFront to serve images faster
+
+✅ Add monitoring with AWS CloudWatch
+
+✅ Add auto-deployment using GitHub Actions
+
+✅ Improve PDF handling with asynchronous Textract (for bigger files)
+
+🔥 Technologies Used
+Service	Purpose
+AWS Lambda	Serverless backend
+AWS S3	Store uploaded files (voice, PDFs)
+AWS Transcribe	Voice to text
+AWS Textract	PDF text extraction
+DynamoDB	Store chat history
+OpenAI	Image generation
+HuggingFace	Q&A and Sentiment analysis
+API Gateway	Connect Lambda with Telegram webhook
+CloudWatch	Logging and monitoring
+🏁 Conclusion
+This project is a complete showcase of how you can use AWS serverless architecture and AI services to build an intelligent Telegram bot that can:
+
+Generate images,
+
+Understand speech,
+
+Analyze sentiments,
+
+Extract information from documents,
+
+And store history for future analytics!
+
+With no server maintenance and pay-per-use scalability, this is a production-grade design!
+
+If you’re excited about cloud-native AI bots, let's connect!
